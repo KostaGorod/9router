@@ -1,0 +1,79 @@
+name: Auto-rebase over upstream
+
+on:
+  schedule:
+    # Every hour — keep the fork and its feature branches rebased over upstream master.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-rebase
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: decolua/9router
+  UPSTREAM_BRANCH: master
+  # Feature branches on the fork that should always be rebased over fresh upstream.
+  REBASE_BRANCHES: combo-context-marker
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork default branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || \
+            git remote set-url upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch upstream "${{ env.UPSTREAM_BRANCH }}" --tags --force
+
+      # Fork master = upstream master + the auto-rebase workflow overlay commit.
+      # Replay the overlay (old_base..master) onto the fresh upstream head.
+      - name: Sync fork master with upstream
+        run: |
+          git checkout master
+          upstream_head="$(git rev-parse "upstream/${{ env.UPSTREAM_BRANCH }}")"
+          old_base="$(git merge-base origin/master "upstream/${{ env.UPSTREAM_BRANCH }}")"
+          echo "upstream head: $upstream_head  old base: $old_base"
+          if [ "$upstream_head" = "$old_base" ]; then
+            echo "fork master already in sync with upstream"
+          elif git rebase --onto "$upstream_head" "$old_base" master; then
+            echo "fork master rebased over fresh upstream"
+          else
+            echo "::error::rebase conflict on fork master; aborting, leaving branch intact"
+            git rebase --abort
+            exit 1
+          fi
+          git push --force-with-lease=master:origin/master origin master
+
+      - name: Rebase feature branches over upstream
+        run: |
+          for branch in ${{ env.REBASE_BRANCHES }}; do
+            if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+              echo "branch $branch not present on fork, skipping"
+              continue
+            fi
+            old_base="$(git merge-base "refs/remotes/origin/$branch" refs/remotes/origin/master)"
+            git checkout "$branch"
+            if git rebase --onto "upstream/${{ env.UPSTREAM_BRANCH }}" "$old_base" "$branch"; then
+              echo "rebased $branch over fresh upstream"
+              git push --force-with-lease="refs/heads/$branch:refs/remotes/origin/$branch" origin "$branch"
+            else
+              echo "::error::rebase conflict on $branch; leaving branch intact"
+              git rebase --abort
+            fi
+          done
