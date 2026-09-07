@@ -1,79 +1,149 @@
-name: Auto-rebase over upstream
+name: Daily upstream merge
 
 on:
   schedule:
-    # Every hour — keep the fork and its feature branches rebased over upstream master.
-    - cron: "17 * * * *"
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
+# This workflow is intentionally fork-only. It updates only the fork's master
+# branch; feature branches and the upstream repository are never pushed.
 concurrency:
-  group: auto-rebase
+  group: daily-upstream-merge
   cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: decolua/9router
   UPSTREAM_BRANCH: master
-  # Feature branches on the fork that should always be rebased over fresh upstream.
-  REBASE_BRANCHES: combo-context-marker
+  NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
-  rebase:
+  validate_merge:
+    if: github.repository == 'KostaGorod/9router'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      fork_sha: ${{ steps.merge.outputs.fork_sha }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+      merge_tree: ${{ steps.merge.outputs.merge_tree }}
     steps:
-      - name: Check out fork default branch
-        uses: actions/checkout@v4
+      - name: Check out fork master
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: master
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
+      - name: Fetch fork and upstream master
         run: |
+          git fetch origin master
+          git checkout -B master origin/master
           git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || \
             git remote set-url upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
-          git fetch upstream "${{ env.UPSTREAM_BRANCH }}" --tags --force
+          git fetch upstream "${{ env.UPSTREAM_BRANCH }}"
 
-      # Fork master = upstream master + the auto-rebase workflow overlay commit.
-      # Replay the overlay (old_base..master) onto the fresh upstream head.
-      - name: Sync fork master with upstream
+      - name: Merge upstream into fork master
+        id: merge
         run: |
-          git checkout master
-          upstream_head="$(git rev-parse "upstream/${{ env.UPSTREAM_BRANCH }}")"
-          old_base="$(git merge-base origin/master "upstream/${{ env.UPSTREAM_BRANCH }}")"
-          echo "upstream head: $upstream_head  old base: $old_base"
-          if [ "$upstream_head" = "$old_base" ]; then
-            echo "fork master already in sync with upstream"
-          elif git rebase --onto "$upstream_head" "$old_base" master; then
-            echo "fork master rebased over fresh upstream"
-          else
-            echo "::error::rebase conflict on fork master; aborting, leaving branch intact"
-            git rebase --abort
+          fork_sha="$(git rev-parse origin/master)"
+          upstream_sha="$(git rev-parse "upstream/${{ env.UPSTREAM_BRANCH }}")"
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" "$fork_sha"; then
+            echo "Fork master already contains upstream master."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit --no-ff "$upstream_sha"; then
+            git merge --abort || true
+            echo "::error::Upstream merge conflicted; fork master was not published."
             exit 1
           fi
-          git push --force-with-lease=master:origin/master origin master
 
-      - name: Rebase feature branches over upstream
+          echo "merge_tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      # Install scripts are unnecessary for this build and may invoke optional
+      # native dependencies. Runtime falls back to sql.js when they are absent.
+      # Upstream currently has no npm lockfile, so use npm install as the explicit
+      # fallback until one exists; npm ci remains preferred when a lockfile lands.
+      - name: Install dependencies
+        if: steps.merge.outputs.changed == 'true'
         run: |
-          for branch in ${{ env.REBASE_BRANCHES }}; do
-            if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-              echo "branch $branch not present on fork, skipping"
-              continue
-            fi
-            old_base="$(git merge-base "refs/remotes/origin/$branch" refs/remotes/origin/master)"
-            git checkout "$branch"
-            if git rebase --onto "upstream/${{ env.UPSTREAM_BRANCH }}" "$old_base" "$branch"; then
-              echo "rebased $branch over fresh upstream"
-              git push --force-with-lease="refs/heads/$branch:refs/remotes/origin/$branch" origin "$branch"
-            else
-              echo "::error::rebase conflict on $branch; leaving branch intact"
-              git rebase --abort
-            fi
-          done
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --ignore-scripts
+          else
+            npm install --ignore-scripts --no-package-lock
+          fi
+
+      - name: Build merged result
+        if: steps.merge.outputs.changed == 'true'
+        run: npm run build
+
+  publish:
+    if: >-
+      github.repository == 'KostaGorod/9router' &&
+      needs.validate_merge.outputs.changed == 'true'
+    needs: validate_merge
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Publish from a fresh checkout. No merged repository code runs in this
+      # write-enabled job.
+      - name: Check out fork master
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recreate validated merge
+        env:
+          FORK_SHA: ${{ needs.validate_merge.outputs.fork_sha }}
+          UPSTREAM_SHA: ${{ needs.validate_merge.outputs.upstream_sha }}
+          MERGE_TREE: ${{ needs.validate_merge.outputs.merge_tree }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          if [ "$(git rev-parse origin/master)" != "$FORK_SHA" ]; then
+            echo "::error::Fork master changed during validation; refusing to publish."
+            exit 1
+          fi
+
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || \
+            git remote set-url upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch upstream "${{ env.UPSTREAM_BRANCH }}"
+          git checkout -B master "$FORK_SHA"
+          git merge --no-edit --no-ff "$UPSTREAM_SHA"
+          if [ "$(git rev-parse 'HEAD^{tree}')" != "$MERGE_TREE" ]; then
+            echo "::error::Recreated merge differs from the validated build."
+            exit 1
+          fi
+
+      # A plain push is deliberate: no history is rewritten, and a concurrent
+      # update to fork master causes a non-fast-forward rejection. Credentials
+      # are supplied only to this command and are not persisted in the checkout.
+      - name: Publish merged master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git -c credential.helper='!gh auth git-credential' push origin master:master
