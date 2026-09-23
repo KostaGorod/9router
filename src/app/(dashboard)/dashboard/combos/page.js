@@ -10,8 +10,8 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { aggregateComboCapabilities } from "open-sse/providers/capabilities.js";
 
-// Validate combo name: only a-z, A-Z, 0-9, -, _
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+// Validate combo name: a-z, A-Z, 0-9, -, _, . and [] (e.g. `[1m]` context-window marker)
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 // Capacity adapter: global fallback pools of models per input-modality capability.
 // A request needing a capability the target model/combo lacks switches straight

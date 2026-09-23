@@ -15,7 +15,8 @@ function parseModelEntry(entry) {
   return { providerId: entry.slice(0, idx), model: entry.slice(idx + 1) };
 }
 
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+// a-z, A-Z, 0-9, -, _, . and [] — [] allowed for `[1m]` context-window markers
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 const KIND_LABELS = {
   webSearch: "Web Search",
