@@ -6,7 +6,8 @@ import Input from "./Input";
 import Button from "./Button";
 import ModelSelectModal from "./ModelSelectModal";
 
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+// a-z, A-Z, 0-9, -, _, . and [] — [] allowed for `[1m]` context-window markers
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 // Inline editable model item
 function ModelItem({ index, model, isFirst, isLast, onEdit, onMoveUp, onMoveDown, onRemove }) {

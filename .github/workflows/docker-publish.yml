@@ -1,60 +1,206 @@
-name: Build and Push Docker Image
-
+name: Publish verified Kosta GHCR image
+# Only the serialized sync workflow calls this. Imported upstream tags never
+# trigger publication; GITHUB_TOKEN pushes need no second workflow event.
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
-
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      commit:
+        required: true
+        type: string
+      upstream:
+        required: true
+        type: string
+      upstream_tag:
+        required: true
+        type: string
+permissions:
+  contents: read
 env:
-  GHCR_IMAGE: ghcr.io/${{ github.repository }}
-  DOCKERHUB_IMAGE: decolua/9router
-
+  GHCR_IMAGE: ghcr.io/kostagorod/9router
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  COMMIT: ${{ inputs.commit }}
+  UPSTREAM_SHA: ${{ inputs.upstream }}
+  UPSTREAM_TAG: ${{ inputs.upstream_tag }}
 jobs:
-  build-and-push:
+  prepare:
+    if: github.repository == 'KostaGorod/9router' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-
+      packages: read
+    outputs:
+      existing: ${{ steps.check.outputs.existing }}
+      digest: ${{ steps.check.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Validate fork tag, source versions and existing image
+        id: check
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch --no-tags https://github.com/decolua/9router.git '+refs/tags/*:refs/upstream-tags/*'
+          node ../workflow/scripts/kosta-image.mjs prepare
 
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.GHCR_IMAGE }}
-            ${{ env.DOCKERHUB_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push
+      - name: Build native platform by digest (no version tags yet)
+        id: image
+        if: needs.prepare.outputs.existing != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: APP_VERSION=${{ inputs.release_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/KostaGorod/9router
+            org.opencontainers.image.revision=${{ inputs.commit }}
+            org.opencontainers.image.version=${{ inputs.release_tag }}
+            io.kosta.upstream.revision=${{ inputs.upstream }}
+            io.kosta.upstream.tag=${{ inputs.upstream_tag }}
+          cache-from: type=gha,scope=kosta-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=kosta-${{ matrix.suffix }}
           provenance: false
           sbom: false
+      - name: Smoke-test native image (also on partial-publication retries)
+        env:
+          DIGEST: ${{ steps.image.outputs.digest || needs.prepare.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$DIGEST"
+          name="kosta-smoke-${GITHUB_RUN_ID}-${SUFFIX}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$name" --platform "$PLATFORM" --publish 20128:20128 "${GHCR_IMAGE}@${DIGEST}"
+          for _attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:20128/api/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs "$name"
+          exit 1
+      - name: Export verified platform digest
+        if: needs.prepare.outputs.existing != 'true'
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/$SUFFIX"
+      - uses: actions/upload-artifact@v4
+        if: needs.prepare.outputs.existing != 'true'
+        with:
+          name: digest-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/digests/${{ matrix.suffix }}
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@v4
+        if: needs.prepare.outputs.existing != 'true'
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish or reuse immutable verified manifest
+        id: manifest
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch --no-tags https://github.com/decolua/9router.git '+refs/tags/*:refs/upstream-tags/*'
+          node ../workflow/scripts/kosta-image.mjs publish
+      - name: Smoke-test resolved multi-platform manifest
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          name="kosta-manifest-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$name" --platform linux/amd64 --publish 20128:20128 "${GHCR_IMAGE}@${DIGEST}"
+          for _attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:20128/api/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs "$name"
+          exit 1
+      - name: Promote stable alias and publish stable GitHub release
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: node ../workflow/scripts/kosta-image.mjs finalize
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-manifest
+          path: ${{ runner.temp }}/version-manifest.json
+          if-no-files-found: error

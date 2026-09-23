@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({
   getCustomModels: vi.fn(),
   getModelAliases: vi.fn(),
   getDisabledModels: vi.fn(),
+  resolveQoderModels: vi.fn(),
+  resolveClineModels: vi.fn(),
 }));
 
 vi.mock("@/lib/localDb", () => ({
@@ -15,6 +17,14 @@ vi.mock("@/lib/localDb", () => ({
   getModelAliases: mocks.getModelAliases,
 }));
 vi.mock("@/lib/disabledModelsDb", () => ({ getDisabledModels: mocks.getDisabledModels }));
+vi.mock("open-sse/services/qoderModels.js", async (importOriginal) => ({
+  ...(await importOriginal()),
+  resolveQoderModels: mocks.resolveQoderModels,
+}));
+vi.mock("open-sse/services/clinepassModels.js", async (importOriginal) => ({
+  ...(await importOriginal()),
+  resolveClineModels: mocks.resolveClineModels,
+}));
 
 const { buildModelsList } = await import("../../src/app/api/v1/models/route.js");
 
@@ -80,5 +90,33 @@ describe("custom model /v1/models metadata", () => {
     expect(unknown).not.toHaveProperty("max_completion_tokens");
     expect(unknown.capabilities).not.toHaveProperty("contextWindow");
     expect(unknown.capabilities).not.toHaveProperty("maxOutput");
+  });
+
+  it("retains upstream combo capability aggregation alongside saved limits", async () => {
+    mocks.getCombos.mockResolvedValue([
+      { name: "inner", models: ["opencode-go/mimo-v2.5"] },
+      { name: "outer", models: ["inner"] },
+    ]);
+    const models = await buildModelsList(["llm"], { skipDynamicFetch: true });
+    expect(models.find((model) => model.id === "outer").capabilities).toMatchObject({
+      vision: true, contextWindow: 1048576,
+    });
+    expect(models.find((model) => model.id === "prefix-a/shared").context_length).toBe(131072);
+  });
+
+  it("retains Cline live discovery", async () => {
+    mocks.getProviderConnections.mockResolvedValue([{ provider: "cline", apiKey: "fixture" }]);
+    mocks.resolveClineModels.mockResolvedValue({ models: [{ id: "live-cline-fixture" }] });
+    const models = await buildModelsList(["llm"]);
+    expect(mocks.resolveClineModels).toHaveBeenCalledWith({ accessToken: undefined, apiKey: "fixture" });
+    expect(models.some((model) => model.id.endsWith("/live-cline-fixture"))).toBe(true);
+  });
+
+  it.each(["qoder", "qoder-cn"])("retains %s regional PAT discovery", async (provider) => {
+    mocks.getProviderConnections.mockResolvedValue([{ provider, apiKey: "fixture" }]);
+    mocks.resolveQoderModels.mockResolvedValue({ models: [{ id: "live-qoder-fixture", name: "Fixture" }] });
+    const models = await buildModelsList(["llm"]);
+    expect(mocks.resolveQoderModels).toHaveBeenCalledWith(expect.objectContaining({ provider, apiKey: "fixture" }));
+    expect(models.some((model) => model.id.endsWith("/live-qoder-fixture"))).toBe(true);
   });
 });
