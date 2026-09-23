@@ -1,0 +1,74 @@
+name: Fork CI
+on:
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  test:
+    if: github.repository == 'KostaGorod/9router'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install supported dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install --ignore-scripts --no-package-lock; fi
+          npm --prefix tests install --ignore-scripts --no-package-lock
+      - name: Release fixtures and fork regressions
+        run: |
+          node --test tests/release/kosta-release.test.mjs
+          node --check scripts/kosta-image.mjs
+          cd tests
+          npx vitest run unit/custom-model-v1-list.test.js unit/custom-model-limits-route.test.js unit/model-token-limits.test.js unit/combo-context-marker.test.js unit/combo-capabilities.test.js
+      - name: Build exact candidate
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
+  container:
+    if: github.repository == 'KostaGorod/9router'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: kosta-pr:test
+          build-args: APP_VERSION=pr-validation
+          provenance: false
+      - name: Native container health check (no registry publication)
+        run: |
+          set -Eeuo pipefail
+          trap 'docker rm -f kosta-pr >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name kosta-pr --publish 20128:20128 kosta-pr:test
+          for _attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:20128/api/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs kosta-pr
+          exit 1
