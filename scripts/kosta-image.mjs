@@ -10,7 +10,7 @@ assert(/^v\d+\.\d+\.\d+-kosta\.[1-9]\d*$/.test(tag || ''), 'Invalid fork tag');
 assert(git('rev-parse', `${tag}^{commit}`) === commit, 'Tag/commit mismatch');
 assert(ancestor(upstream, commit), 'Missing upstream ancestry');
 const planned = plan(commit, upstream);
-assert(planned.tag === tag && planned.upstream_tag === upstreamTag, 'Release provenance mismatch');
+assert(planned.tag === tag && planned.upstream === upstream && planned.upstream_tag === upstreamTag, 'Release provenance mismatch');
 
 async function api(path, options = {}, allowMissing = false) {
   const response = await fetch(`https://api.github.com/repos/KostaGorod/9router/${path}`, {
@@ -19,6 +19,30 @@ async function api(path, options = {}, allowMissing = false) {
   if (allowMissing && response.status === 404) return null;
   assert(response.ok, `GitHub ${path}: HTTP ${response.status}`);
   return response.status === 204 ? null : response.json();
+}
+async function findRelease() {
+  // The tag endpoint excludes drafts. An authorized, paginated listing must
+  // succeed before absence is established, including after a lost POST response.
+  const published = await api(`releases/tags/${tag}`, {}, true);
+  const matches = new Map(published ? [[published.id, published]] : []);
+  for (let page = 1; ; page++) {
+    const releases = await api(`releases?per_page=100&page=${page}`);
+    assert(Array.isArray(releases), 'Invalid release listing');
+    for (const release of releases) {
+      if (release.tag_name === tag) matches.set(release.id, release);
+    }
+    if (releases.length < 100) break;
+  }
+  assert(matches.size <= 1, 'Multiple releases match this tag; operator recovery required');
+  return matches.values().next().value;
+}
+async function evidenceMatches(asset, evidence) {
+  if (asset.state !== 'uploaded' || asset.size !== evidence.length) return false;
+  const response = await fetch(`https://api.github.com/repos/KostaGorod/9router/releases/assets/${asset.id}`, {
+    headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/octet-stream' },
+  });
+  assert(response.ok, `Release evidence readback: HTTP ${response.status}`);
+  return Buffer.from(await response.arrayBuffer()).equals(evidence);
 }
 const packageResponse = await fetch('https://api.github.com/users/KostaGorod/packages/container/9router', {
   headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' },
@@ -92,24 +116,31 @@ if (command === 'prepare') {
   docker('buildx', 'imagetools', 'create', '--tag', `${image}:kosta`, `${image}@${index.digest}`);
   assert((await manifest('kosta')).digest === index.digest, 'Stable alias readback mismatch');
   const forkLog = git('log', '--format=- %h %s', `${upstream}..${commit}`);
-  const upstreamLog = git('log', '--format=- %h %s', `refs/upstream-tags/${upstreamTag}..${upstream}`);
+  const upstreamLog = git('log', '--format=- %h %s', `${planned.upstream_tag_commit}..${upstream}`);
   const body = `Fork commit: ${commit}\nUpstream master: ${upstream}\nUpstream tag: ${upstreamTag}\nRegistry: ${image}:${tag}\nDigest: ${index.digest}\nStable alias: ${image}:kosta\n\n## Fork commits\n${forkLog}\n\n## Upstream changes since ${upstreamTag}\n${upstreamLog || 'None (tagged upstream head).'}\n\nUpstream changelog: https://github.com/decolua/9router/blob/${upstream}/CHANGELOG.md\n\nBoth native linux/amd64 and linux/arm64 images passed /api/health checks. Package versions remain upstream-owned. Watchtower is not configured.\n`;
-  let release = await api(`releases/tags/${tag}`, {}, true);
+  let release = await findRelease();
   if (!release) release = await api('releases', { method: 'POST', body: JSON.stringify({ tag_name: tag, target_commitish: commit, name: tag, body, draft: true, prerelease: false }) });
-  assert(release.tag_name === tag && !release.prerelease, 'Existing release mismatch');
+  assert(Number.isSafeInteger(release.id) && release.id > 0 && release.tag_name === tag && release.target_commitish === commit && release.name === tag && !release.prerelease && release.body === body, 'Existing release mismatch');
+  const evidence = Buffer.from(JSON.stringify(index, null, 2));
+  const assets = release.assets.filter((a) => a.name === 'version-manifest.json');
+  const reusable = assets.length === 1 && await evidenceMatches(assets[0], evidence);
   if (!release.draft) {
-    assert(release.body === body, 'Published release metadata differs; refusing overwrite');
-    assert(release.assets.some((a) => a.name === 'version-manifest.json'), 'Published release missing digest evidence');
+    assert(reusable, 'Published release evidence differs; refusing overwrite');
   } else {
-    // Draft asset replacement makes a failed upload/publication retry resumable.
-    for (const asset of release.assets.filter((a) => a.name === 'version-manifest.json')) await api(`releases/assets/${asset.id}`, { method: 'DELETE' });
-    const upload = await fetch(`${release.upload_url.split('{')[0]}?name=version-manifest.json`, {
-      method: 'POST', headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, 'Content-Type': 'application/json' }, body: readFileSync(`${process.env.RUNNER_TEMP}/version-manifest.json`),
-    });
-    assert(upload.ok, `Release evidence upload: HTTP ${upload.status}`);
+    // A lost upload response may have committed the asset. Reuse verified bytes;
+    // only incomplete/mismatching draft evidence can be replaced.
+    if (!reusable) {
+      for (const asset of assets) await api(`releases/assets/${asset.id}`, { method: 'DELETE' });
+      const upload = await fetch(`https://uploads.github.com/repos/KostaGorod/9router/releases/${release.id}/assets?name=version-manifest.json`, {
+        method: 'POST', headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, 'Content-Type': 'application/json' }, body: evidence,
+      });
+      assert(upload.ok, `Release evidence upload: HTTP ${upload.status}`);
+    }
     await api(`releases/${release.id}`, { method: 'PATCH', body: JSON.stringify({ name: tag, body, draft: false, prerelease: false, make_latest: 'true' }) });
   }
   const verified = await api(`releases/tags/${tag}`);
-  assert(!verified.draft && !verified.prerelease && verified.body === body && verified.assets.some((a) => a.name === 'version-manifest.json'), 'Release readback failed');
+  assert(verified.id === release.id && verified.tag_name === tag && verified.target_commitish === commit && !verified.draft && !verified.prerelease && verified.body === body, 'Release readback failed');
+  const verifiedAssets = verified.assets.filter((a) => a.name === 'version-manifest.json');
+  assert(verifiedAssets.length === 1 && await evidenceMatches(verifiedAssets[0], evidence), 'Release evidence readback failed');
   appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Published Kosta release\n${verified.html_url}\n\n${image}@${index.digest}\n`);
 } else throw new Error('Unknown image command');

@@ -63,10 +63,11 @@ export function upstreamTag(upstream) {
   assert(ref, 'No upstream stable version tag is ancestral to upstream master');
   return ref.slice('refs/upstream-tags/'.length);
 }
-export function plan(commit, upstream) {
-  sha(commit); sha(upstream);
-  assert(ancestor(upstream, commit), 'Source does not contain upstream');
-  const base = upstreamTag(upstream);
+function validateRelease(release) {
+  const { tag, commit, upstream, upstream_tag: base, upstream_tag_commit: tagCommit } = release;
+  assert(/^v\d+\.\d+\.\d+$/.test(base || '') && /^v\d+\.\d+\.\d+-kosta\.[1-9]\d*$/.test(tag || '') && tag.startsWith(`${base}-kosta.`), 'Invalid fork tag/provenance');
+  sha(commit); sha(upstream); sha(tagCommit);
+  assert(ancestor(upstream, commit) && ancestor(tagCommit, upstream), 'Source does not contain upstream provenance');
   // Root and CLI versions belong to upstream and need not equal each other or
   // the last release tag (master may already contain unreleased commits).
   for (const file of ['package.json', 'cli/package.json']) {
@@ -74,6 +75,21 @@ export function plan(commit, upstream) {
     assert(/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(version), `Invalid ${file} version`);
     assert(version === JSON.parse(git('show', `${upstream}:${file}`)).version, `Fork changed upstream-owned ${file} version`);
   }
+  return { tag, commit, upstream, upstream_tag: base, upstream_tag_commit: tagCommit };
+}
+export function allocation(tag) {
+  const ref = `refs/tags/${tag}`;
+  assert(/^v\d+\.\d+\.\d+-kosta\.[1-9]\d*$/.test(tag || ''), 'Invalid fork tag');
+  assert(git('cat-file', '-t', ref) === 'tag', 'Existing allocation lacks frozen provenance; operator recovery required, never move the tag');
+  let stored;
+  try { stored = JSON.parse(git('for-each-ref', '--format=%(contents)', ref)); }
+  catch { throw new Error('Existing allocation has invalid provenance; operator recovery required'); }
+  assert(stored?.schema === 1 && stored.tag === tag && stored.commit === git('rev-parse', `${ref}^{commit}`), 'Invalid allocation identity');
+  return validateRelease(stored);
+}
+export function plan(commit, upstream) {
+  sha(commit); sha(upstream);
+  assert(ancestor(upstream, commit), 'Source does not contain upstream');
   const tags = git('tag', '--list', 'v*-kosta.*').split('\n').filter(Boolean);
   let next = 1;
   let existing;
@@ -84,11 +100,15 @@ export function plan(commit, upstream) {
       assert(!existing, 'Multiple release tags already point at this commit');
       existing = tag;
     }
-    if (tag.startsWith(`${base}-kosta.`)) next = Math.max(next, Number(match[1]) + 1);
+  }
+  // Read immutable allocation before consulting mutable upstream refs/versions.
+  if (existing) return allocation(existing);
+  const base = upstreamTag(upstream);
+  for (const tag of tags) {
+    if (tag.startsWith(`${base}-kosta.`)) next = Math.max(next, Number(tag.split('-kosta.')[1]) + 1);
   }
   assert(Number.isSafeInteger(next), 'Release sequence exceeds safe integer range');
-  if (existing) assert(existing.startsWith(`${base}-kosta.`), 'Existing release has different upstream version');
-  return { tag: existing || `${base}-kosta.${next}`, commit, upstream, upstream_tag: base };
+  return validateRelease({ tag: `${base}-kosta.${next}`, commit, upstream, upstream_tag: base, upstream_tag_commit: git('rev-parse', `refs/upstream-tags/${base}^{commit}`) });
 }
 function output(values) {
   for (const [key, value] of Object.entries(values)) {
@@ -96,18 +116,24 @@ function output(values) {
     if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
   }
 }
-export function publishTag(tag, commit) {
-  assert(/^v\d+\.\d+\.\d+-kosta\.[1-9]\d*$/.test(tag), 'Invalid fork tag');
-  sha(commit); currentHead(commit);
+export function publishTag(release) {
+  const { tag, commit } = validateRelease(release);
+  currentHead(commit);
   const refs = git('ls-remote', '--tags', 'origin', `refs/tags/${tag}`, `refs/tags/${tag}^{}`);
   if (refs) {
     const lines = refs.split('\n');
     const resolved = (lines.find((line) => line.endsWith('^{}')) || lines[0]).split(/\s/)[0];
     assert(resolved === commit, 'Existing tag points to another commit; never move it');
+    git('fetch', '--no-tags', 'origin', `refs/tags/${tag}:refs/tags/${tag}`);
+    assert(JSON.stringify(allocation(tag)) === JSON.stringify(validateRelease(release)), 'Existing tag provenance mismatch; never move it');
   } else {
-    git('-c', 'credential.helper=!gh auth git-credential', 'push', 'origin', `${commit}:refs/tags/${tag}`);
-    assert(git('ls-remote', '--tags', 'origin', `refs/tags/${tag}`).split(/\s/)[0] === commit, 'Tag readback mismatch');
+    if (!git('tag', '--list', tag)) {
+      git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', '-c', 'tag.gpgsign=false', 'tag', '-a', tag, commit, '-m', JSON.stringify({ schema: 1, ...validateRelease(release) }));
+    }
+    assert(JSON.stringify(allocation(tag)) === JSON.stringify(validateRelease(release)), 'Local tag provenance mismatch; never move it');
+    git('-c', 'credential.helper=!gh auth git-credential', 'push', 'origin', `refs/tags/${tag}:refs/tags/${tag}`);
   }
+  assert(git('ls-remote', '--tags', 'origin', `refs/tags/${tag}`).split(/\s/)[0] === git('rev-parse', `refs/tags/${tag}`), 'Tag readback mismatch');
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   guard(process.env.GITHUB_REPOSITORY, process.env.GITHUB_REF);
@@ -118,9 +144,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const result = merge(process.env.FORK_SHA, process.env.UPSTREAM_SHA);
     assert(result.commit === process.env.VALIDATED_COMMIT && result.tree === process.env.VALIDATED_TREE, 'Validated commit/tree mismatch');
     const release = plan(result.commit, result.upstream);
-    git('-c', 'credential.helper=!gh auth git-credential', 'push', 'origin', `${result.commit}:refs/heads/master`);
+    try { git('-c', 'credential.helper=!gh auth git-credential', 'push', 'origin', `${result.commit}:refs/heads/master`); }
+    catch (error) {
+      const workflows = git('diff', '--name-only', result.fork, result.commit, '--', '.github/workflows');
+      if (workflows) {
+        const message = `Source push failed; no release tag allocated. GITHUB_TOKEN contents:write does not grant workflow-file write permission. An authorized operator must review and land a normal merge preserving both histories, then rerun validation on current master. Do not force-push or broaden automation credentials. See docs/KOSTA-RELEASES.md. Changed workflow files:\n${workflows}`;
+        if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Source push blocked\n${message}\n`);
+        throw new Error(message, { cause: error });
+      }
+      throw error;
+    }
     currentHead(result.commit);
-    publishTag(release.tag, release.commit);
+    publishTag(release);
     output(release);
   } else throw new Error('Unknown command');
 }
